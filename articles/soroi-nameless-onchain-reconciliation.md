@@ -85,3 +85,5 @@ export async function autoMatchForUser(
 ステーブルコインの入金消込を自動化するSoroiを、個人で開発しています。実装の続きはこのアカウントで書いていきます。
 
 https://soroi-beryl.vercel.app/?utm_source=sen_zenn&utm_medium=cta&utm_campaign=soroi&utm_content=sen_zenn_b#waitlist
+
+同じような場面で困った経験がある方がいれば、コメントかこのアカウントへの返信で、どんな入金・請求のパターンに一番時間を取られているか教えてください。次の設計判断の参考にします。
