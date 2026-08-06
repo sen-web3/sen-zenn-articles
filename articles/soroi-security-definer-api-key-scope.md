@@ -1,4 +1,10 @@
-# マルチテナントSaaSのAPIキー認証、RLSだけでは防げなかった話 ― SupabaseのSECURITY DEFINER関数で塞いだ穴
+---
+title: "マルチテナントSaaSのAPIキー認証、RLSだけでは防げなかった話 ― SupabaseのSECURITY DEFINER関数で塞いだ穴"
+emoji: "🔐"
+type: "tech"
+topics: ["supabase", "postgresql", "security", "typescript", "rls"]
+published: true
+---
 
 Row Level Security（RLS）とは、PostgreSQLがテーブル単位ではなく行単位でアクセス制御を行う仕組みのことです。テナントごとに閲覧できる行をポリシーで絞り込めるため、マルチテナントSaaSのDB設計で広く使われています。私はステーブルコイン入金消込ツールSoroiを個人開発していて、先日「/api/v1/* 」という外部向け読み取り専用APIをBearerキー認証で実装しました。その過程で、RLSのUSING句だけではテナント分離を表現しきれない経路があることに気づき、SECURITY DEFINER関数と専用DBロールで塞いだので、判断の経緯を書きます。
 
