@@ -2,17 +2,21 @@
 title: "script-srcのunsafe-inlineを消すために、Next.js 16のmiddlewareでリクエスト毎のnonceを配った話"
 emoji: "🔐"
 type: "tech"
-topics: ["nextjs", "csp", "middleware", "security", "typescript"]
+topics: ["nextjs", "csp", "security", "middleware", "webperf"]
 published: true
 ---
 
-CSP（Content Security Policy）とは、ブラウザに対してどのスクリプトやスタイルを実行してよいかをHTTPレスポンスヘッダで指示し、XSSなどのインジェクション攻撃の影響範囲を狭めるためのWeb標準の仕組みです。`script-src`ディレクティブに`'unsafe-inline'`を残していると、攻撃者が注入したインラインスクリプトも「許可された」ものとして実行されてしまうため、CSPを強めに設定していても実質的な防御効果は大きく削がれてしまいます。
+CSPのnonceとは、HTTPレスポンスヘッダのContent-Security-Policyに埋め込む使い捨てのランダム値のことで、その値と一致するnonce属性を持つscriptタグだけを実行許可する仕組みです。strict-dynamicディレクティブと組み合わせると、nonce付きで信頼されたスクリプトが動的に生成した子スクリプトまで連鎖的に許可されるため、unsafe-inlineを外した状態でも安全に動的スクリプト読み込みができます。
 
-私が開発しているオンチェーン向けの検証ツールVouchでも、当初は`script-src 'self' 'unsafe-inline'`という緩めのポリシーで運用していました。理由は単純で、Next.jsのハイドレーション用ブートストラップスクリプトと、SEO用に手動で埋め込んでいたJSON-LDのインラインscriptタグの両方を許可する必要があったからです。今回はこれを`nonce` + `strict-dynamic`に切り替えた際の実装と、途中で踏んだ落とし穴を書き残します。
+Vouchはオンチェーンの取得原価やトランザクション履歴を扱うツールなので、フロントエンドのXSS対策は後回しにしたくない領域です。今回はscript-srcからunsafe-inlineを消す作業の中で、Next.js 16のmiddleware（正式には`proxy.ts`という名前で呼ぶ層です）を使ってリクエストごとに新しいnonceを発行する実装をしました。ここでは実際に詰まった箇所と、その結果として下した設計判断を書きます。
 
-## nonceをリクエスト毎に生成する
+## なぜunsafe-inlineを消す必要があったか
 
-方針はシンプルで、Next.jsのmiddleware（Next.js 16では`proxy.ts`という名前で扱われます）でリクエストごとにランダムなnonceを生成し、CSPヘッダに埋め込みます。
+Vouchでは検証結果の要約をJSON-LDでページに埋め込んでいて、構造化データ用のinline scriptがどうしても発生します。CSPをざっくり`script-src 'self'`だけにすると、このinline scriptとNext.js自身のhydrationブートストラップscriptがどちらも実行できなくなります。よくある回避策がunsafe-inlineを許可することですが、これはXSSが発生した際に攻撃者の注入したscriptタグもそのまま実行されてしまうため、CSPを入れる意味の大部分が消えます。nonceベースに切り替えれば、攻撃者が注入したscriptにはnonce属性がないので実行されず、正規のscriptだけが動きます。
+
+## middlewareでnonceを生成する
+
+Next.jsのmiddlewareは全リクエストの前段で動くので、ここでnonceを生成してレスポンスヘッダに載せるのが自然な位置です。実装は`crypto.getRandomValues`で16バイトのランダム値を作り、base64にエンコードするだけです。
 
 ```ts
 function generateNonce(): string {
@@ -24,9 +28,7 @@ function generateNonce(): string {
 }
 ```
 
-`crypto.getRandomValues`はEdge Runtimeでも動くWeb Crypto APIなので、Node依存の`crypto.randomBytes`を使わずに済みます。16バイトのランダム値をBase64エンコードしてnonceとして使う、というのはCSP仕様でよく見る実装パターンです。
-
-生成したnonceは2箇所に渡します。1つはレスポンスヘッダのCSP自体、もう1つはリクエストヘッダの`x-nonce`です。後者はServer Componentから`headers()`経由で読み出して、JSON-LDのscriptタグに手動でnonce属性をセットするために使います。
+このnonceをCSPヘッダの`script-src`に埋め込み、同時にリクエストヘッダにも`x-nonce`として流し込んでいます。レスポンスだけでなくリクエストヘッダにも積む理由は、後段のServer Componentで`headers()`からこの値を読み出して、手動のscriptタグにnonce属性をつけるためです。
 
 ```ts
 const requestHeaders = new Headers(request.headers);
@@ -39,38 +41,51 @@ const response = NextResponse.next({
 response.headers.set("Content-Security-Policy", contentSecurityPolicy);
 ```
 
-`NextResponse.next()`に`request.headers`を渡すのがポイントで、これをやらないと下流のServer Componentからは`x-nonce`が見えません。レスポンス側にもCSPヘッダをセットしているのは、実際にブラウザへ送るヘッダとリクエスト内部で使い回すヘッダを分けて管理したかったためです。
-
-## strict-dynamicで縛る
-
-`script-src`の中身は次のようにしています。
+script-src自体はこうなっています。
 
 ```ts
 `script-src 'self' 'nonce-${nonce}' 'strict-dynamic'${isDev ? " 'unsafe-eval'" : ""}`,
 ```
 
-`strict-dynamic`を付けると、nonceが付与されたスクリプトから動的に挿入された子スクリプトは、ホワイトリストの個別指定なしに信頼されるようになります。Next.jsのランタイムがチャンクを動的にロードする挙動と相性がよく、`'self'`だけでドメイン管理する場合よりも柔軟です。開発環境では`'unsafe-eval'`をFast Refresh用に許可していますが、本番ビルドでは外しています。
+strict-dynamicを入れているのは、Next.jsがhydration後にコード分割されたチャンクを動的にscriptタグとして挿入するからです。nonceだけだとその動的挿入分がブロックされるので、strict-dynamicで「信頼されたスクリプトが生成した子スクリプトは許可する」という挙動にしています。開発環境だけunsafe-evalを足しているのは、Fast Refreshがevalベースの機構を使うためで、本番ビルドでは外しています。
 
-計装用に入れているPlausibleのビーコン送信は`script-src`ではなく`connect-src`側の話なので、コメントで明示的に区別して書いています。ここを混同すると「スクリプトは動くのにfetchだけ弾かれる」という切り分けにくい不具合になりがちです。
+## Next.jsのhydrationブートストラップは自動で拾ってくれる
+
+ここが最初に驚いた点です。middlewareでCSPヘッダにnonceを載せておくと、Next.js側のRSCハイドレーション用ブートストラップscriptは、こちらが何もしなくても自動的に同じnonceを自分のscriptタグに付与してくれます。App Routerのレンダラーが送出中のレスポンスヘッダを見て、nonceの値を拾ってきているためです。これは公式ドキュメントにも記載がある挙動で、React本体のレンダリング時にnonce propとして内部的に配線されています。
+
+一方でJSON-LDのように自分で書いているinline scriptは、そんな自動配線の対象にはなりません。`src/app/faq`や`src/app/blog/[slug]`ではServer Componentの中で`headers()`を呼び、middlewareが積んだ`x-nonce`を取り出してscriptタグに手動でセットする必要があります。
+
+## ビルド時に焼き込んだnonceが動かない理由
+
+最初にやってしまった失敗が、nonceをビルド時に決めた固定値だと思い込んでいたことです。Next.jsのデフォルトではページは静的にプリレンダリングされる範囲があり、その場合HTMLはビルド時またはリクエスト外のタイミングで一度だけ生成され、その後は同じHTMLがキャッシュから配信されます。もしそのHTML内のnonceがビルド時点の値のまま固定されてしまうと、実行時にmiddlewareが新しく生成するCSPヘッダ側のnonceとは毎回ズレることになります。nonceはCSPの定義上、値が一致しない限りscriptは実行拒否されるので、静的生成のページでnonce付きscriptを使うと本番で確実にブロックされます。
+
+これに気づいたのは、開発環境では動いていたのに本番相当のビルドで検証したときに、JSON-LDのscriptだけがConsoleでCSP違反として弾かれたのを見たときでした。開発サーバーは基本的に毎リクエストレンダリングされるので不整合が起きず、ビルド後の静的化が原因だと分かるまで少し時間がかかりました。
+
+## 対象ルートを動的レンダリングに切り替える
+
+対処として、inline scriptを含むルート（JSON-LDを埋め込んでいるFAQ・ブログ詳細と、hydrationブートストラップを持つ全ページのlayout）を動的レンダリングに切り替えました。`proxy.ts`のコメントにもその判断根拠を残しています。
 
 ```ts
-// https://plausible.io: 全社日次反応レポート向け計装。script自体は
-// strict-dynamic下でNextのnonce付きランタイムからの動的挿入として許可されるが、
-// ビーコン送信(fetch/XHR)は connect-src が別途governsするため明示許可が必須。
+// Nonces must be unique per request, so any route that renders an inline
+// <script> (including the framework's own bootstrap script) must be
+// dynamically rendered — see src/app/layout.tsx.
+```
+
+nonceはリクエストごとに一意である必要があるという性質そのものが、静的生成と根本的に相性が悪いということです。Next.jsではルートの`dynamic`エクスポートやレンダリング中に`headers()`を呼ぶことで動的レンダリングに切り替えられますが、いずれにしても静的最適化の恩恵は失われます。Vouchの場合、FAQやブログ詳細はもとからそこまでトラフィックが多いページではなく、CDNキャッシュ抜きになっても許容範囲だと判断しました。パフォーマンスとセキュリティのどちらを取るかの選択を、ページ単位で意識的に分けたということになります。
+
+## connect-srcは別ディレクティブとして考える必要があった
+
+もう一点、意外と抜け漏れやすかったのがアナリティクス計測タグでした。strict-dynamicの下ではscriptタグの挿入自体はNextのnonce付きランタイム経由なので許可されますが、そのscriptが内部で発行するfetchやXHRのビーコン送信は`connect-src`が別途制御しています。script-srcを締めた勢いでconnect-srcまで`'self'`だけにしてしまうと、計測用のビーコンだけが黙って失敗するという地味な不具合になります。
+
+```ts
 `connect-src 'self' https://plausible.io${isDev ? " ws: wss:" : ""}`,
 ```
 
-## JSON-LDへのnonce注入と、ビルド時焼き込み問題
-
-VouchではFAQページとブログ記事詳細（`src/app/faq`と`src/app/blog/[slug]`）でJSON-LDを手動のscriptタグとして埋め込んでいます。ここに`x-nonce`ヘッダの値を渡すだけなら簡単に見えますが、最初は本番ビルドで動かしてもCSP違反がブラウザコンソールに出続けました。
-
-原因はNext.jsの静的最適化です。対象のルートが静的にプリレンダリングされていると、ビルド時点で一度だけ生成されたnonceがHTMLに焼き込まれてしまい、実行時にmiddlewareが発行する新しいnonceとは一致しません。nonceは仕様上「リクエストごとに一意」でなければ意味がないため、ビルド時に固定された値は本質的にCSPのセキュリティ効果を持たなくなります。
-
-対処として、インラインscriptを持つルート（ブートストラップスクリプトを含むルートすべて）を動的レンダリングに切り替えました。`layout.tsx`側で動的レンダリングを強制する設定を入れ、Next.jsのRSCハイドレーションスクリプトとJSON-LDの両方が、常にそのリクエストのCSPヘッダと同じnonceを参照する状態にしています。静的生成によるTTFB・キャッシュ効率のメリットは一部失いますが、CSPを`strict-dynamic`まで締める以上はトレードオフとして許容しています。
+devだけ`ws: wss:`を足しているのはHMRのWebSocket接続を通すためで、これも本番では外れます。
 
 ## まとめ
 
-middlewareでのnonce生成自体はランダムなバイト列をBase64にするだけの数行ですが、実際に効かせるには「どこにnonceを配るか」と「Next.jsのレンダリング戦略がその値の一貫性を壊していないか」を両方確認する必要がありました。特に静的プリレンダリングとリクエスト毎nonceの相性の悪さは、CSPヘッダだけを見ていると気づきにくく、ブラウザ側の違反ログとNext.jsのレンダリング設定を突き合わせて初めて原因が特定できました。CSPを`unsafe-inline`から`strict-dynamic`へ移行する作業をしている方の参考になれば幸いです。
+nonceベースのCSPは、middlewareでの生成自体は数行で終わる一方、hydrationブートストラップと手動scriptの両方に同じ値を通す配線と、静的生成との相性という2つの罠があります。特に後者は動いているように見えて本番ビルドで初めて壊れるパターンなので、CSPを締める作業をするときは必ず本番相当のビルドでConsoleを確認するようにしています。
 
 ---
 
@@ -78,4 +93,4 @@ middlewareでのnonce生成自体はランダムなバイト列をBase64にす�
 
 https://agent-trust-tawny.vercel.app?utm_source=sen_zenn&utm_medium=cta&utm_campaign=vouch&utm_content=sen_zenn_a
 
-※本記事の内容は2026年7月25日時点の情報にもとづきます。
+※本記事の内容は2026年8月10日時点の情報にもとづきます。
