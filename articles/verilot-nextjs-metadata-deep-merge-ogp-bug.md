@@ -1,6 +1,6 @@
 ---
 title: "og:imageは設定したのにリンクカードが出ない ― Next.jsのmetadataがネストしたオブジェクトをdeep mergeしない罠"
-emoji: "🖼️"
+emoji: "🖼"
 type: "tech"
 topics: ["nextjs", "opengraph", "metadata", "typescript", "seo"]
 published: true
