@@ -56,3 +56,4 @@ L1でBase mainnetにUSDCを送るウォレットの秘密鍵を環境変数に�
 https://vet402.com?utm_source=sen_zenn&utm_medium=cta&utm_campaign=vouch&utm_content=sen_zenn_b
 
 ※本記事の内容は2026年8月24日時点の情報にもとづきます。
+
