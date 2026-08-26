@@ -82,6 +82,12 @@ def check_file(path: pathlib.Path) -> list[str]:
 
     if fm.get("title", "").strip() == "":
         problems.append("titleが空")
+    # 2026-08-27是正: Zennはtitle最大70文字。超過すると「保存に失敗しました」で
+    # バッチ全体が中断し、以降の全pushが公開されない（8/17の71文字タイトル1本が
+    # 8/17〜8/26の全デプロイを止めた実例。emoji事故と同じ「1本が全体を殺す」構造）。
+    title_len = len(fm.get("title", "").strip().strip('"'))
+    if title_len > 70:
+        problems.append(f"titleが70文字を超えている（{title_len}文字・Zenn上限で全デプロイが中断する）")
 
     return problems
 
